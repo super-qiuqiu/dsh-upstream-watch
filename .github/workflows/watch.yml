@@ -1,0 +1,93 @@
+name: dsh-upstream-watch
+
+on:
+  schedule:
+    # GitHub Actions 的 cron 是 UTC；*/15 即每 15 分钟一次（高负载时可能延迟几分钟）
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      test_message:
+        description: '只发一条测试消息到 Telegram（不改状态）'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: dsh-upstream-watch
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check upstream tags
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          TEST_MESSAGE: ${{ inputs.test_message }}
+        run: |
+          set -euo pipefail
+
+          send_tg() {
+            curl -sS --fail -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TG_CHAT_ID}" \
+              --data-urlencode "text=$1" \
+              --data-urlencode "disable_web_page_preview=true" >/dev/null
+          }
+
+          if [ -n "${TEST_MESSAGE:-}" ]; then
+            send_tg "${TEST_MESSAGE}"
+            echo "test message delivered"
+            exit 0
+          fi
+
+          latest="$(git ls-remote --tags --refs \
+              https://github.com/deepseek-ai/deepseek-harness.git 'dsh-v*' \
+            | awk '{print $2}' | sed 's#refs/tags/##' | grep -E '^dsh-v[0-9]' \
+            | python3 -c '
+import re, sys
+
+def key(tag):
+    m = re.match(r"^dsh-v(\d+)\.(\d+)\.(\d+)(?:-(.+))?$", tag)
+    if not m:
+        return ((0, 0, 0), (-1,))
+    nums = tuple(int(x) for x in m.group(1, 2, 3))
+    pre = m.group(4)
+    if pre is None:
+        return (nums, (1,))
+    parts = []
+    for p in pre.split("."):
+        parts.append((1, int(p)) if p.isdigit() else (0, p))
+    return (nums, (0, tuple(parts)))
+
+tags = [line.strip() for line in sys.stdin if line.strip()]
+if not tags:
+    raise SystemExit("no tags parsed")
+print(max(tags, key=key))
+')"
+
+          prev="$(cat state/last-tag 2>/dev/null || true)"
+          echo "latest=${latest} prev=${prev}"
+          if [ "${latest}" = "${prev}" ]; then
+            echo "no change"
+            exit 0
+          fi
+
+          mkdir -p state
+          printf '%s\n' "${latest}" > state/last-tag
+
+          send_tg "DSH 上游新发版：${latest}
+上次记录：${prev:-（首次记录）}
+代码：https://github.com/deepseek-ai/deepseek-harness/tree/${latest}
+动作：git merge 该 tag 到 dcc-alpha3，再跑 dsh-desktop update"
+
+          git config user.name "dsh-upstream-watch"
+          git config user.email "dsh-upstream-watch@users.noreply.github.com"
+          git add state/last-tag
+          git commit -m "chore: record upstream tag ${latest}"
+          git push

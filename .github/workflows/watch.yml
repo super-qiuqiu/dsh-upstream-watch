@@ -2,9 +2,13 @@ name: dsh-upstream-watch
 
 on:
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch:
     inputs:
+      preview:
+        description: 'Render the notice for this tag into the log (no Telegram send, state unchanged)'
+        required: false
+        default: ''
       test_message:
         description: 'Send this text to Telegram as a delivery test (state unchanged)'
         required: false
@@ -20,12 +24,20 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
+      - name: Preview notice (log only)
+        if: github.event_name == 'workflow_dispatch' && inputs.preview != ''
+        env:
+          PREVIEW_TAG: ${{ inputs.preview }}
+        run: |
+          set -euo pipefail
+          LATEST="${PREVIEW_TAG}" python3 scripts/notify.py
+
       - name: Send test message
-        if: github.event_name == 'workflow_dispatch' && inputs.test_message != ''
+        if: github.event_name == 'workflow_dispatch' && inputs.test_message != '' && inputs.preview == ''
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
@@ -34,12 +46,13 @@ jobs:
           set -euo pipefail
           curl -sS --fail -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${TG_CHAT_ID}" \
+            --data-urlencode "parse_mode=HTML" \
             --data-urlencode "text=${TEST_MESSAGE}" \
             --data-urlencode "disable_web_page_preview=true" >/dev/null
           echo "test message delivered"
 
       - name: Check upstream tags
-        if: github.event_name != 'workflow_dispatch' || inputs.test_message == ''
+        if: github.event_name != 'workflow_dispatch' || (inputs.preview == '' && inputs.test_message == '')
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
@@ -49,18 +62,46 @@ jobs:
             | awk '{print $2}' | sed 's#refs/tags/##' \
             | python3 scripts/latest-tag.py)"
           prev="$(cat state/last-tag 2>/dev/null || true)"
-          echo "latest=${latest} prev=${prev}"
+          echo "latest=${latest} prev=${prev:-none}"
           if [ "${latest}" = "${prev}" ]; then
             echo "no change"
             exit 0
           fi
-          mkdir -p state
-          printf '%s\n' "${latest}" > state/last-tag
-          text="DSH 上游新发版：${latest}；上次记录：${prev:-首次记录}；代码：https://github.com/deepseek-ai/deepseek-harness/tree/${latest}；动作：git merge 该 tag 到 dcc-alpha3，再跑 dsh-desktop update"
+
+          # The tag can appear a few minutes before its release notes are published.
+          # Retry inside this run so the notice goes out as soon as the notes exist.
+          message=""
+          attempt=1
+          while [ "${attempt}" -le 6 ]; do
+            if message="$(LATEST="${latest}" python3 scripts/notify.py)"; then
+              break
+            fi
+            status=$?
+            message=""
+            if [ "${status}" -ne 3 ]; then
+              echo "render failed with exit ${status}"
+              exit 1
+            fi
+            echo "release notes not published yet (attempt ${attempt}/6)"
+            if [ "${attempt}" -lt 6 ]; then
+              sleep 45
+            fi
+            attempt=$((attempt + 1))
+          done
+
+          if [ -z "${message}" ]; then
+            echo "release notes still missing; leaving state unchanged for the next run"
+            exit 0
+          fi
+
           curl -sS --fail -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${TG_CHAT_ID}" \
-            --data-urlencode "text=${text}" \
+            --data-urlencode "parse_mode=HTML" \
+            --data-urlencode "text=${message}" \
             --data-urlencode "disable_web_page_preview=true" >/dev/null
+
+          mkdir -p state
+          printf '%s\n' "${latest}" > state/last-tag
           git config user.name "dsh-upstream-watch"
           git config user.email "dsh-upstream-watch@users.noreply.github.com"
           git add state/last-tag
